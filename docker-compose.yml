@@ -1,0 +1,35 @@
+# Each long-running process is its own container so one crash never takes down the others.
+# Keep exactly ONE listener and ONE executor (event ordering + at-most-once semantics rely on it).
+x-app: &app
+  build: .
+  env_file: .env
+  depends_on: [db]
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    restart: unless-stopped
+  web: # Django admin (put it behind HTTPS + restrict access)
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+  listener:
+    <<: *app
+    command: python manage.py run_listener
+  executor:
+    <<: *app
+    command: python manage.py run_executor
+  guardian:
+    <<: *app
+    command: python manage.py run_guardian
+  bot:
+    <<: *app
+    command: python manage.py run_bot
+
+volumes:
+  pgdata:
