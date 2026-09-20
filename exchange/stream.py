@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from .bingx import WS_URL, BingXClient
 from .parsing import decode_ws_message, loads
@@ -21,10 +21,13 @@ async def _keepalive(client: BingXClient, listen_key: str) -> None:
             log.exception("listen key keepalive failed")
 
 
-async def stream_messages(client: BingXClient) -> AsyncIterator[dict]:
-    """Yield decoded JSON messages forever, reconnecting with backoff."""
+async def stream_messages(client: BingXClient, on_event: Callable[[str], None] | None = None) -> AsyncIterator[dict]:
+    """Yield decoded JSON messages forever, reconnecting with backoff.
+    `on_event` (optional, must be quick and non-blocking) is told 'connected', 'frame' (ANY frame, pings
+    included) and 'disconnected', so a watchdog can tell a healthy stream from a dead or silent one."""
     import websockets  # imported lazily so pure modules stay importable without it
 
+    emit = on_event or (lambda _event: None)
     backoff = 1
     while True:
         keepalive = None
@@ -33,8 +36,10 @@ async def stream_messages(client: BingXClient) -> AsyncIterator[dict]:
             keepalive = asyncio.create_task(_keepalive(client, listen_key))
             async with websockets.connect(f"{WS_URL}?listenKey={listen_key}", ping_interval=None) as ws:
                 log.info("master stream connected")
+                emit("connected")
                 backoff = 1
                 async for raw in ws:
+                    emit("frame")
                     text = decode_ws_message(raw)
                     if text.strip() == "Ping":
                         await ws.send("Pong")
@@ -47,6 +52,7 @@ async def stream_messages(client: BingXClient) -> AsyncIterator[dict]:
         except Exception:
             log.exception("master stream error; reconnecting in %ss", backoff)
         finally:
+            emit("disconnected")
             if keepalive:
                 keepalive.cancel()
         await asyncio.sleep(backoff)

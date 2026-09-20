@@ -115,6 +115,12 @@ class MasterEvent(models.Model):
     master_equity = models.DecimalField(max_digits=28, decimal_places=10)
     raw = models.JSONField(default=dict)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True)
+    # Filled only on the fill that FULLY closes a position (used for the PnL card):
+    result_entry_price = models.DecimalField(max_digits=28, decimal_places=10, null=True, blank=True)
+    result_exit_price = models.DecimalField(max_digits=28, decimal_places=10, null=True, blank=True)
+    result_leverage = models.PositiveSmallIntegerField(null=True, blank=True)
+    result_qty = models.DecimalField(max_digits=28, decimal_places=10, null=True, blank=True)
+    card_status = models.CharField(max_length=10, default="none", db_index=True)  # none|pending|offered|posting|posted|skipped
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -159,3 +165,22 @@ class GuardEvent(models.Model):
     kind = models.CharField(max_length=32)   # max_daily_loss | stop_loss
     detail = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+
+
+class Heartbeat(models.Model):
+    """Each long-running process updates its row every few seconds; the monitor alerts when one goes quiet."""
+    name = models.CharField(max_length=32, unique=True)
+    beat_at = models.DateTimeField()
+    detail = models.CharField(max_length=200, blank=True)
+
+
+class TermsAcceptance(models.Model):
+    """Append-only record of who accepted which version of the risk disclosure, and when."""
+    follower = models.ForeignKey(Follower, on_delete=models.CASCADE, related_name="terms_acceptances")
+    version = models.CharField(max_length=32)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["follower", "version"], name="one_acceptance_per_version")]

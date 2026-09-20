@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import ApiCredential, CopyOrder, Follower, GuardEvent, MasterEvent, SystemState
+from .models import ApiCredential, CopyOrder, Follower, GuardEvent, Heartbeat, MasterEvent, SystemState, TermsAcceptance
 
 
 @admin.register(SystemState)
@@ -45,3 +45,16 @@ class CopyOrderAdmin(admin.ModelAdmin):
 class GuardEventAdmin(admin.ModelAdmin):
     list_display = ("id", "follower", "kind", "detail", "created_at")
     list_filter = ("kind",)
+
+
+
+
+@admin.register(Heartbeat)
+class HeartbeatAdmin(admin.ModelAdmin):
+    list_display = ("name", "beat_at", "detail")
+
+
+@admin.register(TermsAcceptance)
+class TermsAcceptanceAdmin(admin.ModelAdmin):
+    list_display = ("follower", "version", "accepted_at")
+    list_filter = ("version",)

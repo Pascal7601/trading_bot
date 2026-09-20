@@ -1,5 +1,8 @@
 """Telegram bot for followers (aiogram 3). Settings are changed with tap-buttons, not typed commands."""
+import asyncio
+import json
 import logging
+from datetime import timedelta
 from decimal import Decimal
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -12,28 +15,53 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from django.conf import settings
 from django.utils import timezone
 
+from engine.keycheck import evaluate_key
 from exchange.bingx import BingXClient
 
-from ..models import ApiCredential, Follower
+from ..models import ApiCredential, CopyOrder, Follower, MasterEvent, TermsAcceptance
+from .alerts import alert_admin
+from .community import card_loop, post_to_community
+from .heartbeat import beat
 from .reports import build_report
 
 log = logging.getLogger(__name__)
 router = Router()
+router.message.filter(F.chat.type == "private")                # privacy: every personal command works in DMs only
+router.callback_query.filter(F.message.chat.type == "private")
+group_router = Router()                                        # what the bot does when spoken to in a group
 
 WELCOME = (
     "Welcome! This bot copies the trader's new BingX futures trades onto YOUR BingX account.\n\n"
     "⚠️ Trading is risky and you can lose money. Copied trades will NOT match the trader's fills exactly "
     "(slippage, timing, size). You are solely responsible for your account. Nothing here is financial advice.\n\n"
-    "Commands:\n/connect – link your BingX API key\n/settings – sizing and safety limits (tap to change)\n"
+    "Commands:\n/connect – link your BingX API key (you'll read and accept the terms first)\n"
+    "/settings – sizing and safety limits (tap to change)\n"
     "/status – your setup and latest copies\n/report – your last 7 days\n"
-    "/pause  /resume – stop or restart copying\n/disconnect – delete your stored key"
+    "/pause  /resume – stop or restart copying\n/terms – risk disclosure and terms\n"
+    "/disconnect – delete your stored key"
+)
+
+TERMS_TEXT = (
+    "📜 Risk disclosure and terms. Please read.\n\n"
+    "• Trading leveraged crypto futures is very risky. You can lose some or ALL of your money, and fast markets "
+    "or high leverage can make losses larger and quicker than you expect.\n"
+    "• This service copies the trader's trades automatically. Your fills WILL differ from his (timing, price, size). "
+    "Trades can be delayed, skipped or fail, and the service itself can go down.\n"
+    "• Past results of the trader or of this service do not predict future results. Nothing here is investment, "
+    "legal or tax advice.\n"
+    "• You stay in full control of your BingX account and funds. The bot has no withdrawal access and you must "
+    "never enable withdrawals on the API key. You are responsible for keeping your key and account secure.\n"
+    "• You choose your own size and safety limits (/settings). You can pause or disconnect at any time; open "
+    "positions are NOT closed automatically when you do.\n"
+    "• The service is provided as is, without guarantees. Use only money you can afford to lose, and only where "
+    "this is legal for you."
 )
 
 KEY_HELP = (
     "Create a BingX API key with ONLY futures trading permission.\n"
-    "• Do NOT enable withdrawals.\n"
+    "• Do NOT enable withdrawals (I will refuse keys that allow them).\n"
     f"• Whitelist this IP on the key: {settings.SERVER_IP}\n"
-    "• Your account must be in Hedge (two-way) position mode.\n\n"
+    "• Your futures account must be in Hedge (two-way) position mode.\n\n"
     "Now send your API KEY. I will delete your message right after reading it. (/cancel to stop)"
 )
 
@@ -71,6 +99,14 @@ def _num(v) -> str:
 
 def _show(v, unit: str = "") -> str:
     return "off" if v is None else f"{_num(v)}{unit}"
+
+
+def terms_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ I understand and accept", callback_data="terms:yes")
+    kb.button(text="❌ No thanks", callback_data="terms:no")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def main_menu(f: Follower) -> tuple[str, InlineKeyboardMarkup]:
@@ -118,12 +154,22 @@ async def _follower(m: Message) -> Follower | None:
     return f
 
 
-async def _edit(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+async def _accepted(telegram_id: int) -> bool:
+    return await TermsAcceptance.objects.filter(
+        follower__telegram_id=telegram_id, version=settings.TERMS_VERSION).aexists()
+
+
+async def _edit(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None) -> None:
     try:
         await cb.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         pass  # "message is not modified"
     await cb.answer()
+
+
+async def _start_key_flow(target: Message, state: FSMContext) -> None:
+    await state.set_state(Connect.api_key)
+    await target.answer(KEY_HELP)
 
 
 @router.message(CommandStart())
@@ -137,12 +183,44 @@ async def cancel(m: Message, state: FSMContext):
     await m.answer("Cancelled.")
 
 
+@router.message(Command("terms"))
+async def terms(m: Message):
+    if await _accepted(m.from_user.id):
+        await m.answer("✅ You have accepted the current version.\n\n" + TERMS_TEXT)
+    else:
+        await m.answer(TERMS_TEXT, reply_markup=terms_keyboard())
+
+
+@router.callback_query(F.data == "terms:yes")
+async def terms_yes(cb: CallbackQuery, state: FSMContext):
+    if cb.message.chat.type != "private":
+        return await cb.answer("Please do this in a private chat with me.", show_alert=True)
+    follower, _ = await Follower.objects.aget_or_create(
+        telegram_id=cb.from_user.id, defaults={"username": cb.from_user.username or ""})
+    await TermsAcceptance.objects.aget_or_create(follower=follower, version=settings.TERMS_VERSION)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await cb.answer("Accepted")
+    if await ApiCredential.objects.filter(follower=follower).aexists():
+        await cb.message.answer("✅ Thanks. You're up to date.")
+    else:
+        await _start_key_flow(cb.message, state)
+
+
+@router.callback_query(F.data == "terms:no")
+async def terms_no(cb: CallbackQuery):
+    await _edit(cb, "No problem. Nothing was saved. Send /connect whenever you'd like to continue.", None)
+
+
 @router.message(Command("connect"))
 async def connect(m: Message, state: FSMContext):
     if m.chat.type != "private":
         return await m.answer("Please message me privately to link your account.")
-    await state.set_state(Connect.api_key)
-    await m.answer(KEY_HELP)
+    if not await _accepted(m.from_user.id):
+        return await m.answer(TERMS_TEXT, reply_markup=terms_keyboard())
+    await _start_key_flow(m, state)
 
 
 @router.message(Connect.api_key)
@@ -162,19 +240,32 @@ async def got_secret(m: Message, state: FSMContext):
     key = data.get("api_key", "")
     try:
         async with BingXClient(key, secret, base_url=settings.BINGX_BASE_URL) as client:
-            equity = await client.get_equity()
+            equity = await client.get_equity()  # fails for a wrong key, a missing permission or an unlisted IP
+            perms = await client.get_key_permissions()
+            hedge = await client.get_position_mode()
     except Exception as e:
         log.info("key validation failed for %s: %s", m.from_user.id, type(e).__name__)
         return await m.answer("I couldn't validate that key (wrong key, missing permission, or IP not whitelisted). "
                               "Please check and try /connect again.")
+
+    verdict = evaluate_key(perms, hedge, settings.STRICT_KEY_CHECK)
+    if verdict.inconclusive:  # admin-only: tells you the parser needs adjusting (raw has permissions, no secrets)
+        await alert_admin(f"Key check for user {m.from_user.id} was inconclusive ({'; '.join(verdict.inconclusive)}). "
+                          f"Raw: {json.dumps(perms.raw, default=str)[:800]}", key=f"keycheck:{m.from_user.id}", icon="⚠️")
+    if verdict.blockers:  # nothing has been stored
+        return await m.answer("\n\n".join(verdict.blockers))
+
     follower, _ = await Follower.objects.aget_or_create(
         telegram_id=m.from_user.id, defaults={"username": m.from_user.username or ""})
     cred, _ = await ApiCredential.objects.aget_or_create(follower=follower, defaults={"api_key_enc": "", "api_secret_enc": ""})
     cred.set_keys(key, secret)
     cred.verified_at = timezone.now()
     await cred.asave()
-    await m.answer(f"✅ Linked. Your futures equity is {equity:.2f} USDT.\n"
-                   "Safety limits are ON by default. Review them and your sizing with /settings.")
+    await m.answer("\n\n".join([
+        f"✅ Linked. Your futures equity is {equity:.2f} USDT.\n"
+        "Safety limits are ON by default. Review them and your sizing with /settings.",
+        *verdict.warnings,
+    ]))
 
 
 @router.message(Command("settings"))
@@ -251,8 +342,10 @@ async def status(m: Message):
         f"Sizing: {MODES[f.sizing_mode]} × {_num(f.sizing_value)}",
         f"Limits: slippage {_show(f.max_slippage_pct, '%')} · daily loss {_show(f.max_daily_loss_pct, '%')} · "
         f"stop-loss {_show(f.stop_loss_roi_pct, '%')} · margin {_show(f.max_exposure_pct, '%')}",
-        "", "Latest copies:",
     ]
+    if not await _accepted(m.from_user.id):
+        lines.append("⚠️ You haven't accepted the current terms, so copying is OFF. Send /terms to review and accept.")
+    lines += ["", "Latest copies:"]
     async for c in f.copies.select_related("master_event").order_by("-id")[:5]:
         e = c.master_event
         lines.append(f"• {e.symbol} {e.position_side} {e.side} → {c.status} {c.detail[:60]}")
@@ -298,8 +391,95 @@ async def disconnect(m: Message):
                        "account settings to be safe. Open positions are NOT closed.")
 
 
+def _is_master(user_id: int) -> bool:
+    return str(user_id) == str(settings.MASTER_TELEGRAM_ID)
+
+
+def _is_operator(user_id: int) -> bool:
+    return _is_master(user_id) or str(user_id) == str(settings.ADMIN_CHAT_ID)
+
+
+@router.message(Command("myid"))
+async def my_id(m: Message):
+    await m.answer(f"Your Telegram id is {m.from_user.id}")
+
+
+@router.message(Command("stats"))
+async def stats(m: Message):
+    """Totals only: never who is connected, never any follower's details."""
+    if not _is_operator(m.from_user.id):
+        return
+    linked = Follower.objects.filter(credential__isnull=False, is_banned=False)
+    since = timezone.now() - timedelta(hours=24)
+    today = CopyOrder.objects.filter(created_at__gte=since)
+    await m.answer(
+        "📈 Community bot\n"
+        f"Linked followers: {await linked.acount()}\n"
+        f"Copying now: {await linked.filter(is_active=True, terms_acceptances__version=settings.TERMS_VERSION).acount()}\n"
+        f"Last 24h copies: {await today.filter(status=CopyOrder.Status.FILLED).acount()} done · "
+        f"{await today.filter(status=CopyOrder.Status.SKIPPED).acount()} skipped · "
+        f"{await today.filter(status__in=[CopyOrder.Status.FAILED, CopyOrder.Status.UNKNOWN]).acount()} failed")
+
+
+@router.callback_query(F.data.startswith("card:"))
+async def card_action(cb: CallbackQuery, bot: Bot):
+    if not _is_master(cb.from_user.id):
+        return await cb.answer("Only the trader can do this.", show_alert=True)
+    _, action, raw_id = cb.data.split(":")
+    # Claim the card atomically so a double tap can't post it twice.
+    claimed = await MasterEvent.objects.filter(pk=int(raw_id), card_status="offered").aupdate(card_status="posting")
+    if not claimed:
+        return await cb.answer("Already handled.", show_alert=True)
+    event = await MasterEvent.objects.aget(pk=int(raw_id))
+    if action == "post":
+        try:
+            await post_to_community(bot, event)
+            note = "✅ Posted to the community."
+        except Exception as exc:
+            event.card_status = "skipped"
+            await event.asave(update_fields=["card_status"])
+            await alert_admin(f"Couldn't post the card to the community: {exc}. Is the bot an admin of the community "
+                              "chat, and is COMMUNITY_CHAT_ID right?", key=f"post:{event.id}")
+            note = "❌ Couldn't post it. The admin has been told."
+    else:
+        event.card_status = "skipped"
+        await event.asave(update_fields=["card_status"])
+        note = "🚫 Skipped."
+    try:
+        await cb.message.edit_caption(caption=note, reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+
+@group_router.message(Command("start", "connect", "settings", "status", "report", "terms", "pause", "resume",
+                              "disconnect", "stats", "myid"), F.chat.type.in_({"group", "supergroup"}))
+async def in_group(m: Message, bot: Bot):
+    """Never show personal data in a group: point people to a private chat instead."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔒 Open private chat", url=f"https://t.me/{(await bot.get_me()).username}?start=community")
+    await m.reply("For your privacy I only work in a private chat.", reply_markup=kb.as_markup())
+
+
+@group_router.message(Command("chatid"), F.chat.type.in_({"group", "supergroup", "channel"}))
+async def chat_id(m: Message):
+    """Setup helper: lets the operator read this chat's id for COMMUNITY_CHAT_ID."""
+    if m.from_user and _is_operator(m.from_user.id):
+        await m.reply(f"This chat's id is {m.chat.id}")
+
+async def _heartbeat_loop() -> None:
+    while True:
+        await beat("bot", "polling")
+        await asyncio.sleep(15)
+
 async def run_bot() -> None:
     bot = Bot(settings.TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
+    dp.include_router(group_router)
     dp.include_router(router)
-    await dp.start_polling(bot)
+    tasks = [asyncio.create_task(_heartbeat_loop()), asyncio.create_task(card_loop(bot))]
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in tasks:
+            task.cancel()

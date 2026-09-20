@@ -27,6 +27,9 @@ services:
   guardian:
     <<: *app
     command: python manage.py run_guardian
+  monitor:
+    <<: *app
+    command: python manage.py run_monitor
   bot:
     <<: *app
     command: python manage.py run_bot

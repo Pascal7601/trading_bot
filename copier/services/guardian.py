@@ -19,6 +19,8 @@ from engine.pnl import roi_pct
 from exchange.bingx import BingXClient, Position
 
 from ..models import EquitySnapshot, Follower, GuardEvent
+from .alerts import alert_admin
+from .heartbeat import beat
 from .notify import notify
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,8 @@ async def _trip_daily_loss(client, follower: Follower, positions: list[Position]
             else "Your open positions were NOT all closed: please review them on BingX.")
     await notify(follower.telegram_id, f"🛑 Daily loss limit hit ({drawdown:.1f}% below your 24h peak). "
                                        f"Copying is paused. {tail}\nUse /settings to resume when you're ready.")
+    await alert_admin(f"{follower} hit their daily loss limit ({drawdown:.1f}%): paused"
+                    f"{', positions closed' if closed else ''}.", icon="ℹ️")
 
 
 async def _check_stop(client, follower: Follower, limits, pos: Position, prices: dict) -> None:
@@ -127,10 +131,13 @@ async def run_guardian() -> None:
         started = time.monotonic()
         try:
             await guard_cycle()
+            await beat("guardian")
             if started - last_prune > 3600:
                 last_prune = started
                 cutoff = timezone.now() - timedelta(days=KEEP_SNAPSHOTS_DAYS)
                 await EquitySnapshot.objects.filter(created_at__lt=cutoff).adelete()
-        except Exception:
+        except Exception as exc:
             log.exception("guardian cycle crashed")
+            await alert_admin(f"Guardian cycle crashed: {type(exc).__name__}. Stop-losses and daily-loss limits may "
+                              "not be enforced.", key="guardian_crash")
         await asyncio.sleep(max(1.0, POLL_SECONDS - (time.monotonic() - started)))

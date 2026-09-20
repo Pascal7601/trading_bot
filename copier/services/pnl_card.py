@@ -202,7 +202,7 @@ def generate_pnl_card(
 
 
 if __name__ == "__main__":  # python -m copier.pnl_card
-    demo = dict(brand="@YourCommunity", closed_at=datetime(2026, 9, 19, 12, 53, tzinfo=timezone.utc))
+    demo = dict(brand="@phil_fx1", closed_at=datetime(2026, 9, 19, 12, 53, tzinfo=timezone.utc))
     Path("preview_profit.jpg").write_bytes(generate_pnl_card(
         "BTC-USDT", "LONG", 10, Decimal("60250.5"), Decimal("63180.2"), pnl_usdt=Decimal("1243.80"), **demo))
     Path("preview_loss.jpg").write_bytes(generate_pnl_card(

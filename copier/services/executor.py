@@ -21,6 +21,9 @@ from exchange.bingx import BingXClient, BingXError
 
 from ..models import CopyOrder, Follower, MasterEvent, SystemState
 from .notify import notify
+from .alerts import alert_admin
+from .heartbeat import beat
+
 
 log = logging.getLogger(__name__)
 _rules = {"at": 0.0, "data": {}}
@@ -123,33 +126,40 @@ async def _copy_one(event: MasterEvent, follower: Follower, opening: bool, rules
         copy.status, copy.quantity, copy.detail, copy.exchange_order_id = status, qty, detail, exch_id
         await copy.asave()
 
-        # --- PnL Card Generation Logic ---
+         # --- PnL Card Generation Logic ---
         photo_bytes = None
         if not opening and status == CopyOrder.Status.FILLED:
             try:
                 from .pnl_card import generate_pnl_card
-                
-                raw_entry = (event.raw or {}).get("entry_price")
-                entry = Decimal(str(raw_entry)) if raw_entry else Decimal("81200.00")
-                exit_p = event.price
-                lev = event.leverage or 10
 
-                # Calculate the follower's absolute PnL in USDT
-                if event.position_side.upper() == "LONG":
-                    usdt_pnl = (exit_p - entry) * qty
+                # Use the ledger-computed result fields (same source community.py's group card
+                # uses) instead of event.raw / event.leverage, which are only populated for
+                # OPENING fills and are meaningless here.
+                entry = event.result_entry_price
+                exit_p = event.result_exit_price or event.price
+                lev = event.result_leverage
+
+                if entry is None or lev is None:
+                    # Without a real entry price and leverage the ROI would be a guess: skip
+                    # the card entirely rather than render one with made-up numbers.
+                    log.warning("skipping follower PnL card for event %s: result fields missing", event.id)
                 else:
-                    usdt_pnl = (entry - exit_p) * qty
-                
-                photo_bytes = generate_pnl_card(
-                    symbol=event.symbol,
-                    side=event.position_side,
-                    leverage=int(lev),
-                    entry_price=entry,
-                    exit_price=exit_p,
-                    pnl_usdt=usdt_pnl,
-                    image_format="PNG",
-                    brand="@phil_fx1"
-                )
+                    # Follower's OWN absolute PnL in USDT, using their own closed quantity.
+                    if event.position_side.upper() == "LONG":
+                        usdt_pnl = (exit_p - entry) * qty
+                    else:
+                        usdt_pnl = (entry - exit_p) * qty
+
+                    photo_bytes = generate_pnl_card(
+                        symbol=event.symbol,
+                        side=event.position_side,
+                        leverage=int(lev),
+                        entry_price=entry,
+                        exit_price=exit_p,
+                        pnl_usdt=usdt_pnl,
+                        image_format="PNG",
+                        brand=f"@{follower.username}" if follower.username else "",
+                    )
             except Exception as e:
                 log.exception("Failed to generate PnL card for event %s: %s", event.id, e)
 
@@ -179,6 +189,8 @@ async def process_event(event: MasterEvent) -> None:
     opening = is_open(event.side, event.position_side)
     age = (timezone.now() - event.created_at).total_seconds()
     if opening and age > settings.MAX_OPEN_EVENT_AGE_SECONDS:
+        await alert_admin(f"Skipped a STALE open ({event.symbol} {event.position_side}, {age:.0f}s old): the executor "
+                          "was down or backed up, so followers did not copy it.", key=f"stale:{event.id}")
         return await finish(MasterEvent.Status.SKIPPED, f"stale open ({age:.0f}s old), not copied")
 
     rules = await _symbol_rules(event.symbol)
@@ -187,7 +199,8 @@ async def process_event(event: MasterEvent) -> None:
     market_price = await _current_price(event.symbol) if opening else None
 
     followers = [f async for f in Follower.objects.filter(
-        is_active=True, is_banned=False, credential__isnull=False).select_related("credential")]
+        is_active=True, is_banned=False, credential__isnull=False,
+        terms_acceptances__version=settings.TERMS_VERSION).select_related("credential")]
     sem = asyncio.Semaphore(settings.MAX_CONCURRENCY)
     await asyncio.gather(*(_copy_one(event, f, opening, rules, market_price, sem) for f in followers))
     await finish(MasterEvent.Status.DONE)
@@ -198,11 +211,14 @@ async def run_executor(poll_seconds: float = 0.3) -> None:
     # Single executor process: events are handled strictly in order (an open is always processed before its close).
     await MasterEvent.objects.filter(status=MasterEvent.Status.PROCESSING).aupdate(status=MasterEvent.Status.PENDING)
     while True:
+        await beat("executor")
         event = await MasterEvent.objects.filter(status=MasterEvent.Status.PENDING).order_by("id").afirst()
         if event is None:
             await asyncio.sleep(poll_seconds)
             continue
         try:
             await process_event(event)
-        except Exception:
+        except Exception as exc:
             log.exception("event %s crashed", event.id)
+            await alert_admin(f"Executor crashed while copying master trade #{event.id} ({event.symbol}): "
+                              f"{type(exc).__name__}. Some followers may NOT have copied it.", key=f"exec:{event.id}")

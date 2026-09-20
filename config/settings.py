@@ -75,3 +75,18 @@ LOGGING = {
     "root": {"handlers": ["console"], "level": env("LOG_LEVEL", "INFO")},
 }
 SERVER_IP = env("SERVER_IP", "<your server IP>")           # shown to followers for API-key IP whitelisting
+
+
+# ---- operations / compliance -------------------------------------------------
+ADMIN_CHAT_ID = env("ADMIN_CHAT_ID", "")                 # your Telegram user/group id: receives operational alerts
+STRICT_KEY_CHECK = env("STRICT_KEY_CHECK", "1") == "1"   # 1 = refuse keys whose permissions cannot be verified
+TERMS_VERSION = env("TERMS_VERSION", "2026-09-v1")       # bump it to make every follower accept the terms again
+STREAM_SILENCE_ALERT_SECONDS = int(env("STREAM_SILENCE_ALERT_SECONDS", "180"))  # 0 = don't alert on a silent stream
+HEALTHCHECK_URL = env("HEALTHCHECK_URL", "")             # optional dead-man's-switch URL (e.g. healthchecks.io)
+
+
+# ---- community group / PnL cards ---------------------------------------------
+CARD_MODE = env("CARD_MODE", "approve")                  # off | approve (the master taps Post) | auto
+MASTER_TELEGRAM_ID = env("MASTER_TELEGRAM_ID", "")       # the trader's own Telegram id: approves cards, sees /stats
+COMMUNITY_CHAT_ID = env("COMMUNITY_CHAT_ID", "")         # the group/channel id (starts with -100...)
+COMMUNITY_BRAND = env("COMMUNITY_BRAND", "")             # small text at the bottom of each card

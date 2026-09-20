@@ -17,6 +17,9 @@ from engine.stats import Income
 from engine.types import SymbolRules
 
 from .signing import build_query, sign
+from engine.keycheck import KeyPermissions
+from .parsing import parse_key_permissions, parse_position_mode
+
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +101,26 @@ class BingXClient:
                                    {"startTime": start_ms, "endTime": end_ms, "limit": limit})
         return [Income(kind=str(i.get("incomeType", "")).upper(), amount=Decimal(str(i.get("income", "0"))))
                 for i in data or []]
+
+    async def get_position_mode(self) -> bool | None:
+        """True = Hedge (two-way), False = One-way, None = could not be determined."""
+        try:
+            data = await self._request("GET", "/openApi/swap/v1/positionSide/dual")
+        except Exception:
+            log.info("position mode lookup failed", exc_info=True)
+            return None
+        return parse_position_mode(data)
+
+    async def get_key_permissions(self) -> KeyPermissions:
+        """What this API key is allowed to do. Two BingX endpoints are merged; the response shape is
+        unverified, so run `python manage.py check_key` once and adjust exchange/parsing.py if needed."""
+        payloads = []
+        for path in ("/openApi/v1/account/apiPermissions", "/openApi/v1/account/apiRestrictions"):
+            try:
+                payloads.append(await self._request("GET", path))
+            except Exception:
+                log.info("key permission lookup failed on %s", path, exc_info=True)
+        return parse_key_permissions(*payloads)
 
     async def get_positions(self, symbol: str | None = None) -> list[Position]:
         params = {"symbol": symbol} if symbol else {}
